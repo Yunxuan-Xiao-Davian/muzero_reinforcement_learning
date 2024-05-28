@@ -1,0 +1,805 @@
+'''
+    Author: Mingchong Li
+    Date: 2022/3/27
+'''
+
+import copy
+import importlib
+import math
+import pathlib
+import pickle
+import time
+import tkinter
+
+import nevergrad
+import numpy
+import ray
+import torch
+from matplotlib import pyplot as plt
+from torch.utils.tensorboard import SummaryWriter
+
+import diagnose_model
+import models
+import replay_buffer
+import self_play
+import shared_storage
+import trainer
+from games.connect4 import connect4_gui
+from games.gomoku_gui import gomoku_gui
+from games.pong import pong
+from games.tank_battle import tank_battle
+from games.tictactoe import *
+from games.twentyone import twentyone
+
+
+class MuZero:
+    """
+    Main class to manage MuZero.
+
+    Args:
+        game_name (str): Name of the game module, it should match the name of a .py file
+        in the "./games" directory.
+
+        config (dict, MuZeroConfig, optional): Override the default config of the game.
+
+        split_resources_in (int, optional): Split the GPU usage when using concurent muzero instances.
+
+    Example:
+        >>> muzero = MuZero("cartpole")
+        >>> muzero.train()
+        >>> muzero.test(render=True)
+    """
+
+    def __init__(self, game_name, config=None, split_resources_in=1):
+        # Load the game and the config from the module with the game name
+        try:
+            game_module = importlib.import_module("games." + game_name)
+            self.Game = game_module.Game
+            self.config = game_module.MuZeroConfig()
+        except ModuleNotFoundError as err:
+            print(
+                f'{game_name} is not a supported game name, try "cartpole" or refer to the documentation for adding a new game.'
+            )
+            raise err
+
+        # Overwrite the config
+        if config:
+            if type(config) is dict:
+                for param, value in config.items():
+                    if hasattr(self.config, param):
+                        setattr(self.config, param, value)
+                    else:
+                        raise AttributeError(
+                            f"{game_name} config has no attribute '{param}'. Check the config file for the complete list of parameters."
+                        )
+            else:
+                self.config = config
+
+        # Fix random generator seed
+        numpy.random.seed(self.config.seed)
+        torch.manual_seed(self.config.seed)
+
+        # Manage GPUs
+        if self.config.max_num_gpus == 0 and (
+            self.config.selfplay_on_gpu
+            or self.config.train_on_gpu
+            or self.config.reanalyse_on_gpu
+        ):
+            raise ValueError(
+                "Inconsistent MuZeroConfig: max_num_gpus = 0 but GPU requested by selfplay_on_gpu or train_on_gpu or reanalyse_on_gpu."
+            )
+        if (
+            self.config.selfplay_on_gpu
+            or self.config.train_on_gpu
+            or self.config.reanalyse_on_gpu
+        ):
+            total_gpus = (
+                self.config.max_num_gpus
+                if self.config.max_num_gpus is not None
+                else torch.cuda.device_count()
+            )
+        else:
+            total_gpus = 0
+        self.num_gpus = total_gpus / split_resources_in
+        if 1 < self.num_gpus:
+            self.num_gpus = math.floor(self.num_gpus)
+
+        ray.init(num_gpus=total_gpus, ignore_reinit_error=True)
+
+        # Checkpoint and replay buffer used to initialize workers
+        self.checkpoint = {
+            "weights": None,
+            "optimizer_state": None,
+            "total_reward": 0,
+            "muzero_reward": 0,
+            "opponent_reward": 0,
+            "episode_length": 0,
+            "mean_value": 0,
+            "training_step": 0,
+            "lr": 0,
+            "total_loss": 0,
+            "value_loss": 0,
+            "reward_loss": 0,
+            "policy_loss": 0,
+            "num_played_games": 0,
+            "num_played_steps": 0,
+            "num_reanalysed_games": 0,
+            "terminate": False,
+        }
+        self.replay_buffer = {}
+
+        cpu_actor = CPUActor.remote()
+        cpu_weights = cpu_actor.get_initial_weights.remote(self.config)
+        self.checkpoint["weights"], self.summary = copy.deepcopy(ray.get(cpu_weights))
+
+        # Workers
+        self.self_play_workers = None
+        self.test_worker = None
+        self.training_worker = None
+        self.reanalyse_worker = None
+        self.replay_buffer_worker = None
+        self.shared_storage_worker = None
+
+    def train(self, log_in_tensorboard=True):
+        """
+        Spawn ray workers and launch the training.
+
+        Args:
+            log_in_tensorboard (bool): Start a testing worker and log its performance in TensorBoard.
+        """
+        if log_in_tensorboard or self.config.save_model:
+            self.config.results_path.mkdir(parents=True, exist_ok=True)
+
+        # Manage GPUs
+        if 0 < self.num_gpus:
+            num_gpus_per_worker = self.num_gpus / (
+                self.config.train_on_gpu
+                + self.config.num_workers * self.config.selfplay_on_gpu
+                + log_in_tensorboard * self.config.selfplay_on_gpu
+                + self.config.use_last_model_value * self.config.reanalyse_on_gpu
+            )
+            if 1 < num_gpus_per_worker:
+                num_gpus_per_worker = math.floor(num_gpus_per_worker)
+        else:
+            num_gpus_per_worker = 0
+
+        # Initialize workers
+        self.training_worker = trainer.Trainer.options(
+            num_cpus=0,
+            num_gpus=num_gpus_per_worker if self.config.train_on_gpu else 0,
+        ).remote(self.checkpoint, self.config)
+
+        self.shared_storage_worker = shared_storage.SharedStorage.remote(
+            self.checkpoint,
+            self.config,
+        )
+        self.shared_storage_worker.set_info.remote("terminate", False)
+
+        self.replay_buffer_worker = replay_buffer.ReplayBuffer.remote(
+            self.checkpoint, self.replay_buffer, self.config
+        )
+
+        if self.config.use_last_model_value:
+            self.reanalyse_worker = replay_buffer.Reanalyse.options(
+                num_cpus=0,
+                num_gpus=num_gpus_per_worker if self.config.reanalyse_on_gpu else 0,
+            ).remote(self.checkpoint, self.config)
+
+        self.self_play_workers = [
+            self_play.SelfPlay.options(
+                num_cpus=0,
+                num_gpus=num_gpus_per_worker if self.config.selfplay_on_gpu else 0,
+            ).remote(
+                self.checkpoint,
+                self.Game,
+                self.config,
+                self.config.seed + seed,
+            )
+            for seed in range(self.config.num_workers)
+        ]
+
+        # Launch workers
+        [
+            self_play_worker.continuous_self_play.remote(
+                self.shared_storage_worker, self.replay_buffer_worker
+            )
+            for self_play_worker in self.self_play_workers
+        ]
+        self.training_worker.continuous_update_weights.remote(
+            self.replay_buffer_worker, self.shared_storage_worker
+        )
+        if self.config.use_last_model_value:
+            self.reanalyse_worker.reanalyse.remote(
+                self.replay_buffer_worker, self.shared_storage_worker
+            )
+
+        if log_in_tensorboard:
+            self.logging_loop(
+                num_gpus_per_worker if self.config.selfplay_on_gpu else 0,
+            )
+
+    def logging_loop(self, num_gpus):
+        """
+        Keep track of the training performance.
+        """
+        # Launch the test worker to get performance metrics
+        self.test_worker = self_play.SelfPlay.options(
+            num_cpus=0,
+            num_gpus=num_gpus,
+        ).remote(
+            self.checkpoint,
+            self.Game,
+            self.config,
+            self.config.seed + self.config.num_workers,
+        )
+        self.test_worker.continuous_self_play.remote(
+            self.shared_storage_worker, None, True
+        )
+
+        # Write everything in TensorBoard
+        writer = SummaryWriter(self.config.results_path)
+
+        print(
+            "\nTraining...\nRun tensorboard --logdir ./results and go to http://localhost:6006/ to see in real time the training performance.\n"
+        )
+
+        # Save hyperparameters to TensorBoard
+        hp_table = [
+            f"| {key} | {value} |" for key, value in self.config.__dict__.items()
+        ]
+        writer.add_text(
+            "Hyperparameters",
+            "| Parameter | Value |\n|-------|-------|\n" + "\n".join(hp_table),
+        )
+        # Save model representation
+        writer.add_text(
+            "Model summary",
+            self.summary,
+        )
+        # Loop for updating the training performance
+        counter = 0
+        keys = [
+            "total_reward",
+            "muzero_reward",
+            "opponent_reward",
+            "episode_length",
+            "mean_value",
+            "training_step",
+            "lr",
+            "total_loss",
+            "value_loss",
+            "reward_loss",
+            "policy_loss",
+            "num_played_games",
+            "num_played_steps",
+            "num_reanalysed_games",
+        ]
+        info = ray.get(self.shared_storage_worker.get_info.remote(keys))
+        con = []
+        muzero_reward = []
+        num_played_steps = []
+        reward_loss = []
+        Training_steps_per_self_played_step_ratio = []
+        try:
+            while info["training_step"] < self.config.training_steps:
+                info = ray.get(self.shared_storage_worker.get_info.remote(keys))
+                writer.add_scalar(
+                    "1.Total_reward/1.Total_reward",
+                    info["total_reward"],
+                    counter,
+                )
+                writer.add_scalar(
+                    "1.Total_reward/2.Mean_value",
+                    info["mean_value"],
+                    counter,
+                )
+                writer.add_scalar(
+                    "1.Total_reward/3.Episode_length",
+                    info["episode_length"],
+                    counter,
+                )
+                writer.add_scalar(
+                    "1.Total_reward/4.MuZero_reward",
+                    info["muzero_reward"],
+                    counter,
+                )
+                writer.add_scalar(
+                    "1.Total_reward/5.Opponent_reward",
+                    info["opponent_reward"],
+                    counter,
+                )
+                writer.add_scalar(
+                    "2.Workers/1.Self_played_games",
+                    info["num_played_games"],
+                    counter,
+                )
+                writer.add_scalar(
+                    "2.Workers/2.Training_steps", info["training_step"], counter
+                )
+                writer.add_scalar(
+                    "2.Workers/3.Self_played_steps", info["num_played_steps"], counter
+                )
+                writer.add_scalar(
+                    "2.Workers/4.Reanalysed_games",
+                    info["num_reanalysed_games"],
+                    counter,
+                )
+                writer.add_scalar(
+                    "2.Workers/5.Training_steps_per_self_played_step_ratio",
+                    info["training_step"] / max(1, info["num_played_steps"]),
+                    counter,
+                )
+                writer.add_scalar("2.Workers/6.Learning_rate", info["lr"], counter)
+                writer.add_scalar(
+                    "3.Loss/1.Total_weighted_loss", info["total_loss"], counter
+                )
+                writer.add_scalar("3.Loss/Value_loss", info["value_loss"], counter)
+                writer.add_scalar("3.Loss/Reward_loss", info["reward_loss"], counter)
+                writer.add_scalar("3.Loss/Policy_loss", info["policy_loss"], counter)
+                print(
+                    f'Last test reward: {info["total_reward"]:.2f}. Training step: {info["training_step"]}/{self.config.training_steps}. Played games: {info["num_played_games"]}. Loss: {info["total_loss"]:.2f}',
+                    end="\r",
+                )
+                con.append(counter)
+                muzero_reward.append((info["muzero_reward"]))
+                num_played_steps.append(info["num_played_steps"])
+                reward_loss.append(info["reward_loss"])
+                Training_steps_per_self_played_step_ratio.append(
+                    info["training_step"] / max(1, info["num_played_steps"]))
+                plt.subplot(221)
+                plt.plot(con, muzero_reward, color='green', label="muzero_reward")
+                plt.ylabel("muzero_reward")
+
+                plt.subplot(222)
+                plt.plot(con, num_played_steps, color='green', label="num_played_steps")
+                plt.ylabel("num_played_steps")
+
+                plt.subplot(223)
+                plt.plot(con, reward_loss, color='green', label="reward_loss")
+                plt.ylabel("reward_loss")
+
+                plt.subplot(224)
+                plt.plot(con, Training_steps_per_self_played_step_ratio, color='green', label="reward_loss")
+                plt.ylabel("Training_steps_per_self_played_step_ratio")
+
+                plt.pause(0.1)
+                counter += 1
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            pass
+
+        self.terminate_workers()
+
+        if self.config.save_model:
+            # Persist replay buffer to disk
+            path = self.config.results_path / "replay_buffer.pkl"
+            print(f"\n\nPersisting replay buffer games to disk at {path}")
+            pickle.dump(
+                {
+                    "buffer": self.replay_buffer,
+                    "num_played_games": self.checkpoint["num_played_games"],
+                    "num_played_steps": self.checkpoint["num_played_steps"],
+                    "num_reanalysed_games": self.checkpoint["num_reanalysed_games"],
+                },
+                open(path, "wb"),
+            )
+
+    def terminate_workers(self):
+        """
+        Softly terminate the running tasks and garbage collect the workers.
+        """
+        if self.shared_storage_worker:
+            self.shared_storage_worker.set_info.remote("terminate", True)
+            self.checkpoint = ray.get(
+                self.shared_storage_worker.get_checkpoint.remote()
+            )
+        if self.replay_buffer_worker:
+            self.replay_buffer = ray.get(self.replay_buffer_worker.get_buffer.remote())
+
+        print("\nShutting down workers...")
+
+        self.self_play_workers = None
+        self.test_worker = None
+        self.training_worker = None
+        self.reanalyse_worker = None
+        self.replay_buffer_worker = None
+        self.shared_storage_worker = None
+
+    def test(
+        self, render=True, opponent=None, muzero_player=None, num_tests=1, num_gpus=0
+    ):
+        """
+        Test the model in a dedicated thread.
+
+        Args:
+            render (bool): To display or not the environment. Defaults to True.
+
+            opponent (str): "self" for self-play, "human" for playing against MuZero and "random"
+            for a random agent, None will use the opponent in the config. Defaults to None.
+
+            muzero_player (int): Player number of MuZero in case of multiplayer
+            games, None let MuZero play all players turn by turn, None will use muzero_player in
+            the config. Defaults to None.
+
+            num_tests (int): Number of games to average. Defaults to 1.
+
+            num_gpus (int): Number of GPUs to use, 0 forces to use the CPU. Defaults to 0.
+        """
+        opponent = opponent if opponent else self.config.opponent
+        muzero_player = muzero_player if muzero_player else self.config.muzero_player
+        self_play_worker = self_play.SelfPlay.options(
+            num_cpus=0,
+            num_gpus=num_gpus,
+        ).remote(self.checkpoint, self.Game, self.config, numpy.random.randint(10000))
+        results = []
+        for i in range(num_tests):
+            print(f"Testing {i+1}/{num_tests}")
+            results.append(
+                ray.get(
+                    self_play_worker.play_game.remote(
+                        0,
+                        0,
+                        render,
+                        opponent,
+                        muzero_player,
+                    )
+                )
+            )
+        self_play_worker.close_game.remote()
+
+        if len(self.config.players) == 1:
+            result = numpy.mean([sum(history.reward_history) for history in results])
+        else:
+            result = numpy.mean(
+                [
+                    sum(
+                        reward
+                        for i, reward in enumerate(history.reward_history)
+                        if history.to_play_history[i - 1] == muzero_player
+                    )
+                    for history in results
+                ]
+            )
+        return result
+
+    def load_model(self, checkpoint_path=None, replay_buffer_path=None):
+        """
+        Load a model and/or a saved replay buffer.
+
+        Args:
+            checkpoint_path (str): Path to model.checkpoint or model.weights.
+
+            replay_buffer_path (str): Path to replay_buffer.pkl
+        """
+        # Load checkpoint
+        if checkpoint_path:
+            checkpoint_path = pathlib.Path(checkpoint_path)
+            self.checkpoint = torch.load(checkpoint_path)
+            print(f"\nUsing checkpoint from {checkpoint_path}")
+
+        # Load replay buffer
+        if replay_buffer_path:
+            replay_buffer_path = pathlib.Path(replay_buffer_path)
+            with open(replay_buffer_path, "rb") as f:
+                replay_buffer_infos = pickle.load(f)
+            self.replay_buffer = replay_buffer_infos["buffer"]
+            self.checkpoint["num_played_steps"] = replay_buffer_infos[
+                "num_played_steps"
+            ]
+            self.checkpoint["num_played_games"] = replay_buffer_infos[
+                "num_played_games"
+            ]
+            self.checkpoint["num_reanalysed_games"] = replay_buffer_infos[
+                "num_reanalysed_games"
+            ]
+
+            print(f"\nInitializing replay buffer with {replay_buffer_path}")
+        else:
+            print(f"Using empty buffer.")
+            self.replay_buffer = {}
+            self.checkpoint["training_step"] = 0
+            self.checkpoint["num_played_steps"] = 0
+            self.checkpoint["num_played_games"] = 0
+            self.checkpoint["num_reanalysed_games"] = 0
+
+    def diagnose_model(self, horizon):
+        """
+        Play a game only with the learned model then play the same trajectory in the real
+        environment and display information.
+
+        Args:
+            horizon (int): Number of timesteps for which we collect information.
+        """
+        game = self.Game(self.config.seed)
+        obs = game.reset()
+        dm = diagnose_model.DiagnoseModel(self.checkpoint, self.config)
+        dm.compare_virtual_with_real_trajectories(obs, game, horizon)
+        input("Press enter to close all plots")
+        dm.close_all()
+
+
+@ray.remote(num_cpus=0, num_gpus=0)
+class CPUActor:
+    # Trick to force DataParallel to stay on CPU to get weights on CPU even if there is a GPU
+    def __init__(self):
+        pass
+
+    def get_initial_weights(self, config):
+        model = models.MuZeroNetwork(config)
+        weigths = model.get_weights()
+        summary = str(model).replace("\n", " \n\n")
+        return weigths, summary
+
+
+def hyperparameter_search(
+    game_name, parametrization, budget, parallel_experiments, num_tests
+):
+    """
+    Search for hyperparameters by launching parallel experiments.
+
+    Args:
+        game_name (str): Name of the game module, it should match the name of a .py file
+        in the "./games" directory.
+
+        parametrization : Nevergrad parametrization, please refer to nevergrad documentation.
+
+        budget (int): Number of experiments to launch in total.
+
+        parallel_experiments (int): Number of experiments to launch in parallel.
+
+        num_tests (int): Number of games to average for evaluating an experiment.
+    """
+    optimizer = nevergrad.optimizers.OnePlusOne(
+        parametrization=parametrization, budget=budget
+    )
+
+    running_experiments = []
+    best_training = None
+    try:
+        # Launch initial experiments
+        for i in range(parallel_experiments):
+            if 0 < budget:
+                param = optimizer.ask()
+                print(f"Launching new experiment: {param.value}")
+                muzero = MuZero(game_name, param.value, parallel_experiments)
+                muzero.param = param
+                muzero.train(False)
+                running_experiments.append(muzero)
+                budget -= 1
+
+        while 0 < budget or any(running_experiments):
+            for i, experiment in enumerate(running_experiments):
+                if experiment and experiment.config.training_steps <= ray.get(
+                    experiment.shared_storage_worker.get_info.remote("training_step")
+                ):
+                    experiment.terminate_workers()
+                    result = experiment.test(False, num_tests=num_tests)
+                    if not best_training or best_training["result"] < result:
+                        best_training = {
+                            "result": result,
+                            "config": experiment.config,
+                            "checkpoint": experiment.checkpoint,
+                        }
+                    print(f"Parameters: {experiment.param.value}")
+                    print(f"Result: {result}")
+                    optimizer.tell(experiment.param, -result)
+
+                    if 0 < budget:
+                        param = optimizer.ask()
+                        print(f"Launching new experiment: {param.value}")
+                        muzero = MuZero(game_name, param.value, parallel_experiments)
+                        muzero.param = param
+                        muzero.train(False)
+                        running_experiments[i] = muzero
+                        budget -= 1
+                    else:
+                        running_experiments[i] = None
+
+    except KeyboardInterrupt:
+        for experiment in running_experiments:
+            if isinstance(experiment, MuZero):
+                experiment.terminate_workers()
+
+    recommendation = optimizer.provide_recommendation()
+    print("Best hyperparameters:")
+    print(recommendation.value)
+    if best_training:
+        # Save best training weights (but it's not the recommended weights)
+        best_training["config"].results_path.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            best_training["checkpoint"],
+            best_training["config"].results_path / "model.checkpoint",
+        )
+        # Save the recommended hyperparameters
+        text_file = open(
+            best_training["config"].results_path / "best_parameters.txt",
+            "w",
+        )
+        text_file.write(str(recommendation.value))
+        text_file.close()
+    return recommendation.value
+
+
+def load_model_menu(muzero, game_name):
+    # Configure running options
+    options = ["Specify paths manually"] + sorted(
+        (pathlib.Path("results") / game_name).glob("*/")
+    )
+    options.reverse()
+    print()
+    for i in range(len(options)):
+        print(f"{i}. {options[i]}")
+
+    choice = input("Enter a number to choose a model to load: ")
+    valid_inputs = [str(i) for i in range(len(options))]
+    while choice not in valid_inputs:
+        choice = input("Invalid input, enter a number listed above: ")
+    choice = int(choice)
+
+    if choice == (len(options) - 1):
+        # manual path option
+        checkpoint_path = input(
+            "Enter a path to the model.checkpoint, or ENTER if none: "
+        )
+        while checkpoint_path and not pathlib.Path(checkpoint_path).is_file():
+            checkpoint_path = input("Invalid checkpoint path. Try again: ")
+        replay_buffer_path = input(
+            "Enter a path to the replay_buffer.pkl, or ENTER if none: "
+        )
+        while replay_buffer_path and not pathlib.Path(replay_buffer_path).is_file():
+            replay_buffer_path = input("Invalid replay buffer path. Try again: ")
+    else:
+        checkpoint_path = options[choice] / "model.checkpoint"
+        replay_buffer_path = options[choice] / "replay_buffer.pkl"
+
+    muzero.load_model(
+        checkpoint_path=checkpoint_path,
+        replay_buffer_path=replay_buffer_path,
+    )
+
+
+
+# parameters
+
+WINDOW_WIDTH = 760
+WINDOW_HEIGHT = 600
+
+
+class window(Tk):
+    button1 = None
+
+    def __init__(self):
+        Tk.__init__(self)
+        self.game = None
+        self.setObjects()
+        self.mainloop()
+
+    def setObjects(self):
+        self.geometry('{}x{}+{}+{}'.format(WINDOW_WIDTH,
+                                           WINDOW_HEIGHT,
+                                           int(self.winfo_screenwidth() / 2 - WINDOW_WIDTH / 2),
+                                           int(self.winfo_screenheight() / 2 - WINDOW_HEIGHT / 2)))
+        self.title("基于强化学习的攻防系统")
+        self.config(bg="#FFFFFF")
+
+        self.window_title = Label(self, text="基于强化学习的攻防系统", font="黑体 25", bg="#FFFFFF")
+
+        self.separate_line = Label(self, width=100, height=1, bg="white")
+
+        global image_connect4
+        global image_gomoku
+        global image_pong
+        global image_tank_wars
+        global image_tic_tac_toe
+        global image_twenty_one
+
+        image_connect4 = tkinter.PhotoImage(file="img/connect4.png")
+        image_gomoku = tkinter.PhotoImage(file="img/gomoku.png")
+        image_pong = tkinter.PhotoImage(file="img/pong.png")
+        image_tank_wars = tkinter.PhotoImage(file="img/tank_wars.png")
+        image_tic_tac_toe = tkinter.PhotoImage(file="img/tic_tac_toe.png")
+        image_twenty_one = tkinter.PhotoImage(file="img/twenty_one.png")
+
+        image_connect4 = image_connect4.subsample(int(image_connect4.width() / 200))
+        image_gomoku = image_gomoku.subsample(int(image_gomoku.width() / 200))
+        image_pong = image_pong.subsample(int(image_pong.width() / 200))
+        image_tank_wars = image_tank_wars.subsample(int(image_tank_wars.width() / 200))
+        image_tic_tac_toe = image_tic_tac_toe.subsample(int(image_tic_tac_toe.width() / 200))
+        image_twenty_one = image_twenty_one.subsample(int(image_twenty_one.width() / 200))
+
+        self.connect4 = Button(self, image=image_connect4, width=200, height=200,bd=3,relief="solid")
+        self.gomoku = Button(self, image=image_gomoku, width=200, height=200,bd=3,relief="solid")
+        self.pong = Button(self, image=image_pong, width=200, height=200,bd=3,relief="solid")
+        self.tank_wars = Button(self, image=image_tank_wars, width=200, height=200,bd=3,relief="solid")
+        self.tic_tac_toe = Button(self, image=image_tic_tac_toe, width=200, height=200,bd=3,relief="solid")
+        self.twenty_one = Button(self, image=image_twenty_one, width=200, height=200,bd=3,relief="solid")
+
+        preset_strings = ["127.0.0.1", "Administrator", "123456"]
+        self.address_label = Label(self, text="地址：", bg="white")
+        self.address_entry = Entry(self, width=15, bg="#D8D8D8", borderwidth=0, fg="black", textvariable=preset_strings[0])
+        self.username_label = Label(self, text="用户名：", bg="white")
+        self.username_entry = Entry(self, width=15, bg="#D8D8D8", borderwidth=0, fg="black", textvariable=preset_strings[1])
+        self.password_label = Label(self, text="密码：", bg="white")
+        self.password_entry = Entry(self, width=15, show="*", bg="#D8D8D8", borderwidth=0, fg="black", textvariable=preset_strings[2])
+
+        self.about_us = Button(self, text="关于我们", bg="#D8D8D8", borderwidth=0, fg="black")
+
+        self.bind_all("<Button>", self.click)
+
+        PAD = 10
+
+        self.window_title.grid(     row=0, column=0, pady=PAD, padx=PAD, columnspan=3)
+        self.separate_line.grid(    row=1, column=0, pady=PAD, padx=PAD, columnspan=3)
+        self.connect4.grid(         row=2, column=0, pady=PAD, padx=PAD)
+        self.gomoku.grid(           row=2, column=1, pady=PAD, padx=PAD)
+        self.pong.grid(             row=2, column=2, pady=PAD, padx=PAD)
+        self.tank_wars.grid(        row=3, column=0, pady=PAD, padx=PAD)
+        self.tic_tac_toe.grid(      row=3, column=1, pady=PAD, padx=PAD)
+        self.twenty_one.grid(       row=3, column=2, pady=PAD, padx=PAD)
+        self.address_label.place(   x=20,   y=570)
+        self.address_entry.place(   x=70,   y=570)
+        self.username_label.place(  x=220,  y=570)
+        self.username_entry.place(  x=270,  y=570)
+        self.password_label.place(  x=420,  y=570)
+        self.password_entry.place(  x=470,  y=570)
+        self.about_us.place(        x=655,  y=570)
+        tkinter.Canvas(self, bg="#D8D8D8", height=5, width=670).place(x=30, y=70)
+
+        options = ["训练", "测试", "修改", "详情"]
+        self.rightList = Listbox(self, font="黑体 16", height=4, width=7, justify="center", borderwidth=0, bg="#D8D8D8", selectbackground="#5BA0CB")
+        for opt in options:
+            self.rightList.insert(END, opt)
+
+        self.update()
+
+    def clear_all(self):
+        self.unbind_all("<Button>")
+        for widget in self.winfo_children():
+            widget.destroy()
+
+    def click(self, e):
+        print("e:", e, "widget:", e.widget, "root:", [e.x_root, e.y_root])
+
+        if str(e.widget)[-6: len(str(e.widget))] == "button":
+            self.game = connect4_gui(self)
+        elif str(e.widget)[-7: len(str(e.widget))] == "button2":
+            self.game = gomoku_gui(self)
+        elif str(e.widget)[-7: len(str(e.widget))] == "button3":
+            self.game = pong(self)
+        elif str(e.widget)[-7: len(str(e.widget))] == "button4":
+            self.game = tank_battle(self)
+        elif str(e.widget)[-7: len(str(e.widget))] == "button5":
+            self.game = tictactoe_gui(self)
+        elif str(e.widget)[-7: len(str(e.widget))] == "button6":
+            self.game = twentyone(self)
+
+        if e.num == 1:
+            if self.game is None:
+                self.rightList.place_forget()
+            elif str(e.widget) == ".!listbox":
+                if self.rightList.curselection()[0] == 0:
+                    print("train", self.game.name)
+                    if self.game is not None:
+                        self.game.train()
+
+                if self.rightList.curselection()[0] == 1:
+                    self.game.test()
+
+                if self.rightList.curselection()[0] == 2:
+                    self.game.option(image_tic_tac_toe)
+
+                if self.rightList.curselection()[0] == 3:
+                    self.game.detail(image_tic_tac_toe)
+
+            else:
+                self.clear_all()
+                self.game.test()
+
+            self.game = None
+
+        if e.num == 3:
+            self.rightList.place(x=e.x_root - self.winfo_x() - 10, y=e.y_root - self.winfo_y() - 25)
+
+
+if __name__ == "__main__":
+    window()
